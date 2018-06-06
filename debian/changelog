@@ -1,3 +1,9 @@
+asks (1.5.18-3) smurf; urgency=medium
+
+  * Dependencies
+
+ -- Matthias Urlichs <matthias@urlichs.de>  Wed, 06 Jun 2018 23:33:11 +0200
+
 asks (1.5.18-2) smurf; urgency=medium
 
   * Ignored build stuff
