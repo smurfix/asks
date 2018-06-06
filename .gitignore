@@ -4,6 +4,7 @@ __pycache__/
 # pytest
 /.cache/
 /.pytest_cache/
+/.pybuild
 
 #env
 env/
