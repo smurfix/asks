@@ -8,14 +8,13 @@ from functools import partialmethod
 from urllib.parse import urlparse, urlunparse
 
 from h11 import RemoteProtocolError
-
-from multio import asynclib
+from anyio import connect_tcp, create_semaphore
 
 from .cookie_utils import CookieTracker
-from .errors import RequestTimeout, BadHttpResponse
+from .errors import BadHttpResponse
 from .req_structs import SocketQ
-from .request_object import Request
-from .utils import get_netloc_port
+from .request_object import RequestProcessor
+from .utils import get_netloc_port, timeout_manager
 
 __all__ = ['Session']
 
@@ -27,18 +26,20 @@ class BaseSession(metaclass=ABCMeta):
     socket to create, and all of the HTTP methods ('GET', 'POST', etc.)
     '''
 
-    def __init__(self, headers=None):
+    def __init__(self, headers=None, ssl_context=None):
         '''
         Args:
             headers (dict): Headers to be applied to all requests.
                 headers set by http method call will take precedence and
                 overwrite headers set by the headers arg.
+            ssl_context (ssl.SSLContext): SSL context to use for https connections.
         '''
         if headers is not None:
             self.headers = headers
         else:
             self.headers = {}
 
+        self.ssl_context = ssl_context
         self.encoding = None
         self.source_address = None
         self._cookie_tracker = None
@@ -58,10 +59,7 @@ class BaseSession(metaclass=ABCMeta):
             location (tuple(str, int)): A tuple of net location (eg
                 '127.0.0.1' or 'example.org') and port (eg 80 or 25000).
         '''
-        sock = await asynclib.open_connection(location[0],
-                                              location[1],
-                                              ssl=False,
-                                              source_addr=self.source_address)
+        sock = await connect_tcp(location[0], location[1], bind_host=self.source_address)
         sock._active = True
         return sock
 
@@ -72,11 +70,10 @@ class BaseSession(metaclass=ABCMeta):
             location (tuple(str, int)): A tuple of net location (eg
                 '127.0.0.1' or 'example.org') and port (eg 80 or 25000).
         '''
-        sock = await asynclib.open_connection(location[0],
-                                              location[1],
-                                              ssl=True,
-                                              server_hostname=location[0],
-                                              source_addr=self.source_address)
+        sock = await connect_tcp(location[0],
+                                 location[1],
+                                 ssl_context=self.ssl_context or True,
+                                 bind_host=self.source_address)
         sock._active = True
         return sock
 
@@ -100,7 +97,8 @@ class BaseSession(metaclass=ABCMeta):
             return await self._open_connection_https(
                 (host, int(port))), port
 
-    async def request(self, method, url=None, *, path='', retries=1, **kwargs):
+    async def request(self, method, url=None, *, path='', retries=1,
+                      connection_timeout=60, **kwargs):
         '''
         This is the template for all of the `http method` methods for
         the Session.
@@ -155,7 +153,7 @@ class BaseSession(metaclass=ABCMeta):
             headers.update(req_headers)
         req_headers = headers
 
-        async with self._sema:
+        async with self.sema:
             if url is None:
                 url = self._make_url() + path
 
@@ -163,23 +161,26 @@ class BaseSession(metaclass=ABCMeta):
 
             sock = None
             try:
-                sock = await self._grab_connection(url)
+                sock = await timeout_manager(
+                    connection_timeout, self._grab_connection, url)
                 port = sock.port
 
-                req_obj = Request(self,
-                                  method,
-                                  url,
-                                  port,
-                                  headers=req_headers,
-                                  encoding=self.encoding,
-                                  sock=sock,
-                                  persist_cookies=self._cookie_tracker,
-                                  **kwargs)
+                req_obj = RequestProcessor(
+                    self,
+                    method,
+                    url,
+                    port,
+                    headers=req_headers,
+                    encoding=self.encoding,
+                    sock=sock,
+                    persist_cookies=self._cookie_tracker,
+                    **kwargs
+                )
 
                 if timeout is None:
                     sock, r = await req_obj.make_request()
                 else:
-                    sock, r = await self.timeout_manager(timeout, req_obj)
+                    sock, r = await timeout_manager(timeout, req_obj.make_request)
 
                 if sock is not None:
                     try:
@@ -203,6 +204,7 @@ class BaseSession(metaclass=ABCMeta):
             except Exception as e:
                 if sock:
                     await self._handle_exception(e, sock)
+                raise
 
             # any BaseException is considered unlawful murder, and
             # Session.cleanup should be called to tidy up sockets.
@@ -230,14 +232,6 @@ class BaseSession(metaclass=ABCMeta):
     put = partialmethod(request, 'PUT')
     delete = partialmethod(request, 'DELETE')
     options = partialmethod(request, 'OPTIONS')
-
-    async def timeout_manager(self, timeout, req_obj):
-        try:
-            async with asynclib.timeout_after(timeout):
-                sock, r = await req_obj.make_request()
-        except asynclib.TaskTimeout as e:
-            raise RequestTimeout from e
-        return sock, r
 
     async def _handle_exception(self, e, sock):
         """
@@ -289,6 +283,7 @@ class Session(BaseSession):
                  headers=None,
                  encoding='utf-8',
                  persist_cookies=None,
+                 ssl_context=None,
                  connections=1):
         '''
         Args:
@@ -300,7 +295,7 @@ class Session(BaseSession):
                 host asks will allow its self to have. The default number of
                 connections is 1. You may increase this value as you see fit.
         '''
-        super().__init__(headers)
+        super().__init__(headers, ssl_context)
         self.encoding = encoding
         self.base_location = base_location
         self.endpoint = endpoint
@@ -312,7 +307,7 @@ class Session(BaseSession):
 
         self._conn_pool = SocketQ()
 
-        self._sema = asynclib.Semaphore(connections)
+        self._sema = create_semaphore(connections)
 
     @property
     def sema(self):

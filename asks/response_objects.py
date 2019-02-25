@@ -7,12 +7,12 @@ from zlib import decompress as zdecompress
 from async_generator import async_generator, yield_
 import h11
 
-from multio import asynclib
-
 from .http_utils import decompress, parse_content_encoding
+from .utils import timeout_manager
+from .errors import BadStatus
 
 
-class Response:
+class BaseResponse:
     '''
     A response object supporting a range of methods and attribs
     for accessing the status line, header, cookies, history and
@@ -39,7 +39,9 @@ class Response:
         self.cookies = []
 
     def __repr__(self):
-        return '<Response {} {}>'.format(self.status_code, self.reason_phrase)
+        return '<{} {} {}>'.format(self.__class__.__name__,
+                                   self.status_code,
+                                   self.reason_phrase)
 
     def _guess_encoding(self):
         try:
@@ -49,65 +51,58 @@ class Response:
         except LookupError:  # IndexError/KeyError are LookupError subclasses
             pass
 
-    def _parse_cookies(self, host):
-        '''
-        Why the hell is this here.
-        '''
-        cookie_pie = []
-        try:
-            for cookie in self.headers['set-cookie']:
-                cookie_jar = {}
-                name_val, *rest = cookie.split(';')
-                name, value = name_val.split('=', 1)
-                cookie_jar['name'] = name.strip()
-                cookie_jar['value'] = value
-                for item in rest:
-                    try:
-                        name, value = item.split('=')
-                        if value.startswith('.'):
-                            value = value[1:]
-                        cookie_jar[name.lower().lstrip()] = value
-                    except ValueError:
-                        cookie_jar[item.lower().lstrip()] = True
-                cookie_pie.append(cookie_jar)
-            self.cookies = [Cookie(host, x) for x in cookie_pie]
-        except KeyError:
-            pass
-
-    def _decompress(self, body, encoding=None):
+    def _decompress(self, encoding=None):
         content_encoding = self.headers.get('Content-Encoding', None)
         if content_encoding is not None:
             decompressor = decompress(parse_content_encoding(content_encoding),
                                       encoding)
-            r = decompressor.send(body)
+            r = decompressor.send(self.body)
             return r
         else:
             if encoding is not None:
-                return body.decode(encoding, errors='replace')
+                return self.body.decode(encoding, errors='replace')
             else:
-                return body
+                return self.body
 
-    def json(self):
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        ...
+
+
+class Response(BaseResponse):
+
+    def json(self, **kwargs):
         '''
         If the response's body is valid json, we load it as a python dict
         and return it.
         '''
-        body = self._decompress(self.body, self.encoding)
-        return _json.loads(body)
+        body = self._decompress(self.encoding)
+        return _json.loads(body, **kwargs)
+
+    def raise_for_status(self):
+        '''
+        Raise BadStatus if one occurred.
+        '''
+        if 400 <= self.status_code < 500:
+            raise BadStatus('{} Client Error: {} for url: {}'.format(self.status_code, self.reason_phrase, self.url))
+        elif 500 <= self.status_code < 600:
+            raise BadStatus('{} Server Error: {} for url: {}'.format(self.status_code, self.reason_phrase, self.url))
 
     @property
     def text(self):
         '''
         Returns the (maybe decompressed) decoded version of the body.
         '''
-        return self._decompress(self.body, self.encoding)
+        return self._decompress(self.encoding)
 
     @property
     def content(self):
         '''
         Returns the content as-is after decompression, if any.
         '''
-        return self._decompress(self.body)
+        return self._decompress()
 
     @property
     def raw(self):
@@ -115,6 +110,60 @@ class Response:
         Returns the response body as received.
         '''
         return self.body
+
+
+class StreamResponse(BaseResponse):
+    ...
+
+
+class StreamBody:
+
+    def __init__(self, hconnection, sock, content_encoding=None, encoding=None):
+        self.hconnection = hconnection
+        self.sock = sock
+        self.content_encoding = content_encoding
+        self.encoding = encoding
+        # TODO: add decompress data to __call__ args
+        self.decompress_data = True
+        self.timeout = None
+
+    @async_generator
+    async def __aiter__(self):
+        if self.content_encoding is not None:
+            decompressor = decompress(parse_content_encoding(self.content_encoding))
+        while True:
+            event = await self._recv_event()
+            if isinstance(event, h11.Data):
+                if self.content_encoding is not None:
+                    if self.decompress_data:
+                        event.data = decompressor.send(event.data)
+                await yield_(event.data)
+            elif isinstance(event, h11.EndOfMessage):
+                break
+
+    async def _recv_event(self):
+        while True:
+            event = self.hconnection.next_event()
+
+            if event is h11.NEED_DATA:
+                data = await timeout_manager(self.timeout, self.sock.receive_some, 10000)
+                self.hconnection.receive_data(data)
+                continue
+
+            return event
+
+    def __call__(self, timeout=None):
+        self.timeout = timeout
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def close(self):
+        await self.sock.close()
+
+    async def __aexit__(self, *exc_info):
+        await self.close()
 
 
 class Cookie(SimpleNamespace):
@@ -145,45 +194,3 @@ class Cookie(SimpleNamespace):
     def __iter__(self):
         for k, v in self.__dict__.items():
             yield k, v
-
-
-class StreamBody:
-
-    def __init__(self, session, hconnection, sock, content_encoding=None, encoding=None):
-        self.session = session
-        self.hconnection = hconnection
-        self.sock = sock
-        self.content_encoding = content_encoding
-        self.encoding = encoding
-
-    @async_generator
-    async def __aiter__(self):
-        if self.content_encoding is not None:
-            decompressor = decompress(parse_content_encoding(self.content_encoding))
-        while True:
-            event = await self._recv_event()
-            if isinstance(event, h11.Data):
-                if self.content_encoding is not None:
-                    event.data = decompressor.send(event.data)
-                await yield_(event.data)
-            elif isinstance(event, h11.EndOfMessage):
-                break
-
-    async def _recv_event(self):
-        while True:
-            event = self.hconnection.next_event()
-            if event is h11.NEED_DATA:
-                self.hconnection.receive_data(
-                    (await asynclib.recv(self.sock, 10000)))
-                continue
-            return event
-
-    async def __aenter__(self):
-        self.session._checked_out_sockets.remove(self.sock)
-        return self
-
-    async def close(self):
-        await self.sock.close()
-
-    async def __aexit__(self, *exc_info):
-        await self.close()

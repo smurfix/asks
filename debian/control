@@ -3,7 +3,7 @@ Maintainer: Matthias Urlichs <matthias@urlichs.de>
 Section: python
 Priority: optional
 Build-Depends: dh-python, python3-setuptools, python3-all, debhelper (>= 9),
-  python3-multio,
+  python3-anyio,
   python3-h11,
 Standards-Version: 3.9.6
 Homepage: https://github.com/theelous3/asks
@@ -11,8 +11,10 @@ Homepage: https://github.com/theelous3/asks
 Package: python3-asks
 Architecture: all
 Depends: ${misc:Depends}, ${python3:Depends},
-  python3-multio,
+  python3-anyio,
   python3-h11,
 Description: asks - async http
- asks is an async http lib for curio and trio
+ asks is an async http library based on h11.
+ .
+ This version is based on anyio.
 

@@ -1,12 +1,13 @@
 # pylint: disable=no-member
 
 import h11
+import pytest
 
-from asks.request_object import Request
+from asks.request_object import RequestProcessor
 
 
 def _catch_response(monkeypatch, headers, data):
-    req = Request(None, 'get', "toot-toot", None)
+    req = RequestProcessor(None, 'get', "toot-toot", None)
     events = [
         h11._events.Response(status_code=200, headers=headers),
         h11._events.Data(data=data),
@@ -32,3 +33,13 @@ def test_http1_1(monkeypatch):
 def test_http1_0(monkeypatch):
     response = _catch_response(monkeypatch, [('Connection', 'close')], b'hello')
     assert response.body == b'hello'
+
+
+@pytest.mark.parametrize(['data', 'query_str'], [
+    [{'foo': 'bar', 'spam': None}, '?foo=bar'],
+    [{'zero': 0}, '?zero=0'],
+    [{'empty': ''}, '?empty='],
+    [{'false': False}, '?false=False'],
+])
+def test_dict_to_query(data, query_str):
+    assert RequestProcessor._dict_to_query(data) == query_str

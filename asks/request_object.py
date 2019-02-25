@@ -5,8 +5,9 @@ for sending them, as well as receiving responses.
 This is the oldest part of asks, and as such is currently not the cleanest
 it could be. Refactors are required to bring it up to spec!
 '''
+from anyio import aopen
 
-__all__ = ['Request']
+__all__ = ['RequestProcessor']
 
 
 from numbers import Number
@@ -19,12 +20,12 @@ import re
 
 import h11
 from h11 import RemoteProtocolError
-from multio import asynclib
 
 from .utils import requote_uri
+from .cookie_utils import parse_cookies
 from .auth import PreResponseAuth, PostResponseAuth
 from .req_structs import CaseInsensitiveDict as c_i_dict
-from .response_objects import Response, StreamBody
+from .response_objects import Response, StreamResponse, StreamBody
 from .errors import TooManyRedirects
 
 
@@ -33,7 +34,7 @@ _WWX_MATCH = re.compile(r'\Aww.\.')
 _MAX_BYTES = 4096
 
 
-class Request:
+class RequestProcessor:
     '''
     Handles the building, formatting and i/o of requests once the calling
     session passes the required info and calls `make_request`.
@@ -66,6 +67,8 @@ class Request:
 
         callback (func): A callback function to be called on each bytechunk of
             of the response body.
+
+        stream (bool): Weather or not to return a StreamResponse vs Response
 
         timeout (int or float): A numeric representation of the longest time to
             wait on a complete response once a request has been sent.
@@ -151,17 +154,19 @@ class Request:
         host = (self.host if (self.port == '80' or
                               self.port == '443')
                 else self.host.split(':')[0] + ':' + self.port)
+
         # default header construction
         asks_headers = c_i_dict([('Host', host),
                                  ('Connection', 'keep-alive'),
                                  ('Accept-Encoding', 'gzip, deflate'),
                                  ('Accept', '*/*'),
                                  ('Content-Length', '0'),
-                                 ('User-Agent', 'python-asks/1.5.18')
+                                 ('User-Agent', 'python-asks/2.2.0')
                                  ])
 
         # check for a CookieTracker object, and if it's there inject
         # the relevant cookies in to the (next) request.
+        # What the fuck is this shit.
         if self.persist_cookies is not None:
             self.cookies.update(
                 self.persist_cookies.get_additional_cookies(
@@ -172,7 +177,7 @@ class Request:
 
         # handle building the request body, if any
         body = ''
-        if any((self.data, self.files, self.json)):
+        if any((self.data, self.files, self.json is not None)):
             content_type, content_len, body = await self._formulate_body()
             asks_headers['Content-Type'] = content_type
             asks_headers['Content-Length'] = content_len
@@ -247,7 +252,7 @@ class Request:
         '''
         await self._send(h11_request, h11_body, hconnection)
         response_obj = await self._catch_response(hconnection)
-        response_obj._parse_cookies(self.host)
+        parse_cookies(response_obj, self.host)
 
         # If there's a cookie tracker object, store any cookies we
         # might've picked up along our travels.
@@ -393,7 +398,7 @@ class Request:
         multipart_ctype = 'multipart/form-data; boundary={}'.format(_BOUNDARY)
 
         if self.data is not None:
-            if self.files or self.json:
+            if self.files or self.json is not None:
                 raise TypeError('data arg cannot be used in conjunction with'
                                 'files or json arg.')
             c_type = 'application/x-www-form-urlencoded'
@@ -404,7 +409,7 @@ class Request:
                 c_type = self.mimetype or 'text/plain'
 
         elif self.files is not None:
-            if self.data or self.json:
+            if self.data or self.json is not None:
                 raise TypeError('files arg cannot be used in conjunction with'
                                 'data or json arg.')
             c_type = multipart_ctype
@@ -419,7 +424,8 @@ class Request:
 
         return c_type, str(len(body)), body
 
-    def _dict_to_query(self, data, params=True, base_query=False):
+    @staticmethod
+    def _dict_to_query(data, params=True, base_query=False):
         '''
         Turns python dicts in to valid body-queries or queries for use directly
         in the request url. Unlike the stdlib quote() and it's variations,
@@ -434,7 +440,7 @@ class Request:
         query = []
 
         for k, v in data.items():
-            if not v:
+            if v is None:
                 continue
             if isinstance(v, (str, Number)):
                 query.append('='.join(quote_plus(x) for x in (k, str(v))))
@@ -504,12 +510,8 @@ class Request:
         return multip_pkg
 
     async def _file_manager(self, path):
-        try:
-            async with asynclib.aopen(path, 'rb') as f:
-                return b''.join(await f.readlines()) + b'\r\n'
-        except AttributeError:
-            async with await asynclib.aopen(path, 'rb') as f:
-                return b''.join(await f.readlines()) + b'\r\n'
+        async with await aopen(path, 'rb') as f:
+            return b''.join(await f.readlines()) + b'\r\n'
 
     async def _catch_response(self, hconnection):
         '''
@@ -570,29 +572,37 @@ class Request:
         if get_body:
             if self.callback is not None:
                 endof = await self._body_callback(hconnection)
-            elif self.stream is not None:
-                if 199 < resp_data['status_code'] < 300:
-                    if not ((self.scheme == self.initial_scheme and
-                            self.host == self.initial_netloc) or
-                            resp_data['headers']['connection'].lower() == 'close'):
-                        self.sock._active = False
-                    resp_data['body'] = StreamBody(
-                        self.session,
-                        hconnection,
-                        self.sock,
-                        resp_data['headers'].get('content-encoding', None),
-                        resp_data['encoding'])
-                    self.streaming = True
+
+            elif self.stream:
+                if not ((self.scheme == self.initial_scheme and
+                        self.host == self.initial_netloc) or
+                        resp_data['headers']['connection'].lower() == 'close'):
+                    self.sock._active = False
+
+                resp_data['body'] = StreamBody(
+                    hconnection,
+                    self.sock,
+                    resp_data['headers'].get('content-encoding', None),
+                    resp_data['encoding'])
+
+                self.streaming = True
+
             else:
                 while True:
                     data = await self._recv_event(hconnection)
+
                     if isinstance(data, h11.Data):
                         resp_data['body'] += data.data
+
                     elif isinstance(data, h11.EndOfMessage):
                         break
+
         else:
             endof = await self._recv_event(hconnection)
             assert isinstance(endof, h11.EndOfMessage)
+
+        if self.streaming:
+            return StreamResponse(**resp_data)
 
         return Response(**resp_data)
 
@@ -600,8 +610,7 @@ class Request:
         while True:
             event = hconnection.next_event()
             if event is h11.NEED_DATA:
-                hconnection.receive_data(
-                    (await asynclib.recv(self.sock, 10000)))
+                hconnection.receive_data(await self.sock.receive_some(10000))
                 continue
             return event
 
@@ -614,11 +623,10 @@ class Request:
             package (list of str): The header package.
             body (str): The str representation of the body.
         '''
-        await asynclib.sendall(self.sock, hconnection.send(request_bytes))
+        await self.sock.send_all(hconnection.send(request_bytes))
         if body_bytes is not None:
-            await asynclib.sendall(self.sock, hconnection.send(body_bytes))
-        await asynclib.sendall(
-            self.sock, hconnection.send(h11.EndOfMessage()))
+            await self.sock.send_all(hconnection.send(body_bytes))
+        await self.sock.send_all(hconnection.send(h11.EndOfMessage()))
 
     async def _auth_handler_pre(self):
         '''
