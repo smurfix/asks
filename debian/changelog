@@ -1,3 +1,9 @@
+asks (2.2.1+anyio1-3) unstable; urgency=medium
+
+  * Test fixes
+
+ -- Matthias Urlichs <matthias@urlichs.de>  Mon, 25 Feb 2019 12:09:09 +0100
+
 asks (2.2.1+anyio2-1) unstable; urgency=medium
 
   * Bugfixes.
