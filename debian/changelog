@@ -1,3 +1,9 @@
+asks (2.2.1+anyio1-5) unstable; urgency=medium
+
+  * Retry once on BadResponse
+
+ -- Matthias Urlichs <matthias@urlichs.de>  Wed, 13 Mar 2019 08:50:44 +0100
+
 asks (2.2.1+anyio1-4) unstable; urgency=medium
 
   * Merge
