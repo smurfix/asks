@@ -1,3 +1,9 @@
+asks (2.2.1+anyio2-1) unstable; urgency=medium
+
+  * Add status code to errors, dammit
+
+ -- Matthias Urlichs <matthias@urlichs.de>  Wed, 13 Mar 2019 11:40:26 +0100
+
 asks (2.2.1+anyio1-6) unstable; urgency=medium
 
   * Merge fixups
