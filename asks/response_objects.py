@@ -1,8 +1,6 @@
 import codecs
 from types import SimpleNamespace
 import json as _json
-from gzip import decompress as gdecompress
-from zlib import decompress as zdecompress
 
 from async_generator import async_generator, yield_
 import h11
@@ -86,9 +84,21 @@ class Response(BaseResponse):
         Raise BadStatus if one occurred.
         '''
         if 400 <= self.status_code < 500:
-            raise BadStatus('{} Client Error: {} for url: {}'.format(self.status_code, self.reason_phrase, self.url), self.status_code)
+            raise BadStatus(
+                '{} Client Error: {} for url: {}'.format(
+                    self.status_code, self.reason_phrase, self.url
+                ),
+                self,
+                self.status_code
+            )
         elif 500 <= self.status_code < 600:
-            raise BadStatus('{} Server Error: {} for url: {}'.format(self.status_code, self.reason_phrase, self.url), self.status_code)
+            raise BadStatus(
+                '{} Server Error: {} for url: {}'.format(
+                    self.status_code, self.reason_phrase, self.url
+                ),
+                self,
+                self.status_code
+            )
 
     @property
     def text(self):
@@ -118,14 +128,15 @@ class StreamResponse(BaseResponse):
 
 class StreamBody:
 
-    def __init__(self, hconnection, sock, content_encoding=None, encoding=None):
-        self.hconnection = hconnection
+    def __init__(self, h11_connection, sock, content_encoding=None, encoding=None):
+        self.h11_connection = h11_connection
         self.sock = sock
         self.content_encoding = content_encoding
         self.encoding = encoding
         # TODO: add decompress data to __call__ args
         self.decompress_data = True
         self.timeout = None
+        self.read_size = 10000
 
     @async_generator
     async def __aiter__(self):
@@ -143,11 +154,11 @@ class StreamBody:
 
     async def _recv_event(self):
         while True:
-            event = self.hconnection.next_event()
+            event = self.h11_connection.next_event()
 
             if event is h11.NEED_DATA:
-                data = await timeout_manager(self.timeout, self.sock.receive_some, 10000)
-                self.hconnection.receive_data(data)
+                data = await timeout_manager(self.timeout, self.sock.receive_some, self.read_size)
+                self.h11_connection.receive_data(data)
                 continue
 
             return event

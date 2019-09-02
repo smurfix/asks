@@ -16,3 +16,6 @@ env/
 
 # docs
 /docs/build/
+
+# editor
+.vscode
