@@ -5,8 +5,6 @@ for sending them, as well as receiving responses.
 This is the oldest part of asks, and as such is currently not the cleanest
 it could be. Refactors are required to bring it up to spec!
 '''
-from anyio import aopen
-
 __all__ = ['RequestProcessor']
 
 
@@ -18,8 +16,8 @@ from random import randint
 import mimetypes
 import re
 
+from anyio import aopen
 import h11
-from h11 import RemoteProtocolError
 
 from .utils import requote_uri
 from .cookie_utils import parse_cookies
@@ -31,7 +29,6 @@ from .errors import TooManyRedirects
 
 _BOUNDARY = "8banana133744910kmmr13a56!102!" + str(randint(1e3, 9e3))
 _WWX_MATCH = re.compile(r'\Aww.\.')
-_MAX_BYTES = 4096
 
 
 class RequestProcessor:
@@ -90,6 +87,7 @@ class RequestProcessor:
         self.port = port
         self.auth = None
         self.auth_off_domain = None
+        self.body = None
         self.data = None
         self.params = None
         self.headers = None
@@ -137,7 +135,7 @@ class RequestProcessor:
                 redirects, the redirect responses will be stored in the final
                 response object's `.history`.
         '''
-        hconnection = h11.Connection(our_role=h11.CLIENT)
+        h11_connection = h11.Connection(our_role=h11.CLIENT)
         (self.scheme,
             self.host,
             self.path,
@@ -157,11 +155,11 @@ class RequestProcessor:
 
         # default header construction
         asks_headers = c_i_dict([('Host', host),
-                                 ('Connection', 'keep-alive'),
+                                 ('Connection', 'close'),
                                  ('Accept-Encoding', 'gzip, deflate'),
                                  ('Accept', '*/*'),
                                  ('Content-Length', '0'),
-                                 ('User-Agent', 'python-asks/2.2.0')
+                                 ('User-Agent', 'python-asks/2.3.5')
                                  ])
 
         # check for a CookieTracker object, and if it's there inject
@@ -181,6 +179,7 @@ class RequestProcessor:
             content_type, content_len, body = await self._formulate_body()
             asks_headers['Content-Type'] = content_type
             asks_headers['Content-Length'] = content_len
+            self.body = body
 
         # add custom headers, if any
         # note that custom headers take precedence
@@ -214,7 +213,7 @@ class RequestProcessor:
                           headers=asks_headers.items())
 
         # call i/o handling func
-        response_obj = await self._request_io(req, req_body, hconnection)
+        response_obj = await self._request_io(req, req_body, h11_connection)
 
         # check to see if the final socket object is suitable to be returned
         # to the calling session's connection pool.
@@ -230,7 +229,7 @@ class RequestProcessor:
 
         return self.sock, response_obj
 
-    async def _request_io(self, h11_request, h11_body, hconnection):
+    async def _request_io(self, h11_request, h11_body, h11_connection):
         '''
         Takes care of the i/o side of the request once it's been built,
         and calls a couple of cleanup functions to check for redirects / store
@@ -240,7 +239,7 @@ class RequestProcessor:
             h11_request (h11.Request): A h11.Request object
             h11_body (h11.Data): A h11.Data object, representing the request
                                  body.
-            hconnection (h11.Connection): The h11 connection for the request.
+            h11_connection (h11.Connection): The h11 connection for the request.
 
         Returns:
             (Response): The final response object, including any response
@@ -250,8 +249,8 @@ class RequestProcessor:
             This function sets off a possible call to `_redirect` which
             is semi-recursive.
         '''
-        await self._send(h11_request, h11_body, hconnection)
-        response_obj = await self._catch_response(hconnection)
+        await self._send(h11_request, h11_body, h11_connection)
+        response_obj = await self._catch_response(h11_connection)
         parse_cookies(response_obj, self.host)
 
         # If there's a cookie tracker object, store any cookies we
@@ -513,7 +512,7 @@ class RequestProcessor:
         async with await aopen(path, 'rb') as f:
             return b''.join(await f.readlines()) + b'\r\n'
 
-    async def _catch_response(self, hconnection):
+    async def _catch_response(self, h11_connection):
         '''
         Instantiates the parser which manages incoming data, first getting
         the headers, storing cookies, and then parsing the response's body,
@@ -532,7 +531,7 @@ class RequestProcessor:
             The most recent response object.
         '''
 
-        response = await self._recv_event(hconnection)
+        response = await self._recv_event(h11_connection)
 
         resp_data = {'encoding': self.encoding,
                      'method': self.method,
@@ -547,7 +546,7 @@ class RequestProcessor:
                      }
 
         for header in response.headers:
-            if header[0] == b'set-cookie':
+            if header[0].lower() == b'set-cookie':
                 try:
                     resp_data['headers']['set-cookie'].append(str(header[1],
                                                                   'utf-8'))
@@ -571,7 +570,7 @@ class RequestProcessor:
 
         if get_body:
             if self.callback is not None:
-                endof = await self._body_callback(hconnection)
+                endof = await self._body_callback(h11_connection)
 
             elif self.stream:
                 if not ((self.scheme == self.initial_scheme and
@@ -580,7 +579,7 @@ class RequestProcessor:
                     self.sock._active = False
 
                 resp_data['body'] = StreamBody(
-                    hconnection,
+                    h11_connection,
                     self.sock,
                     resp_data['headers'].get('content-encoding', None),
                     resp_data['encoding'])
@@ -589,7 +588,7 @@ class RequestProcessor:
 
             else:
                 while True:
-                    data = await self._recv_event(hconnection)
+                    data = await self._recv_event(h11_connection)
 
                     if isinstance(data, h11.Data):
                         resp_data['body'] += data.data
@@ -598,7 +597,7 @@ class RequestProcessor:
                         break
 
         else:
-            endof = await self._recv_event(hconnection)
+            endof = await self._recv_event(h11_connection)
             assert isinstance(endof, h11.EndOfMessage)
 
         if self.streaming:
@@ -606,15 +605,15 @@ class RequestProcessor:
 
         return Response(**resp_data)
 
-    async def _recv_event(self, hconnection):
+    async def _recv_event(self, h11_connection):
         while True:
-            event = hconnection.next_event()
+            event = h11_connection.next_event()
             if event is h11.NEED_DATA:
-                hconnection.receive_data(await self.sock.receive_some(10000))
+                h11_connection.receive_data(await self.sock.receive_some(10000))
                 continue
             return event
 
-    async def _send(self, request_bytes, body_bytes, hconnection):
+    async def _send(self, request_bytes, body_bytes, h11_connection):
         '''
         Takes a package and body, combines then, then shoots 'em off in to
         the ether.
@@ -623,10 +622,10 @@ class RequestProcessor:
             package (list of str): The header package.
             body (str): The str representation of the body.
         '''
-        await self.sock.send_all(hconnection.send(request_bytes))
+        await self.sock.send_all(h11_connection.send(request_bytes))
         if body_bytes is not None:
-            await self.sock.send_all(hconnection.send(body_bytes))
-        await self.sock.send_all(hconnection.send(h11.EndOfMessage()))
+            await self.sock.send_all(h11_connection.send(body_bytes))
+        await self.sock.send_all(h11_connection.send(h11.EndOfMessage()))
 
     async def _auth_handler_pre(self):
         '''
@@ -670,7 +669,7 @@ class RequestProcessor:
             if response_obj.status_code == 401:
                 if not self.auth.auth_attempted:
                     self.history_objects.append(response_obj)
-                    r = await self.make_request()
+                    _, r = await self.make_request()
                     self.auth.auth_attempted = False
                     return r
                 else:
@@ -708,14 +707,14 @@ class RequestProcessor:
             else:
                 return True
 
-    async def _body_callback(self, hconnection):
+    async def _body_callback(self, h11_connection):
         '''
         A callback func to be supplied if the user wants to do something
         directly with the response body's stream.
         '''
         # pylint: disable=not-callable
         while True:
-            next_event = await self._recv_event(hconnection)
+            next_event = await self._recv_event(h11_connection)
             if isinstance(next_event, h11.Data):
                 await self.callback(next_event.data)
             else:

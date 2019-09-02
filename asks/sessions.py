@@ -73,9 +73,10 @@ class BaseSession(metaclass=ABCMeta):
         '''
         sock = await connect_tcp(location[0],
                                  location[1],
-                                 ssl_context=self.ssl_context or ssl.SSLContext(),
+                                 ssl_context=self.ssl_context,
                                  bind_host=self.source_address,
-                                 autostart_tls=True)
+                                 autostart_tls=True,
+                                 tls_standard_compatible=False)
         sock._active = True
         return sock
 
@@ -315,10 +316,13 @@ class Session(BaseSession):
 
         self._conn_pool = SocketQ()
 
-        self._sema = create_semaphore(connections)
+        self._sema = None
+        self._connections = connections
 
     @property
     def sema(self):
+        if self._sema is None:
+            self._sema = create_semaphore(self._connections)
         return self._sema
 
     def _checkout_connection(self, host_loc):
