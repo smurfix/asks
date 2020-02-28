@@ -7,7 +7,7 @@ from functools import partial
 import pytest
 
 from anyio import create_task_group
-import curio
+import anyio
 
 from overly import (
     Server,
@@ -37,10 +37,9 @@ _SSL_CONTEXT = ssl.create_default_context(cadata=default_ssl_cert)
 
 
 def curio_run(func):
+    # not in fact using curio.
     def func_wrapper(*args, **kwargs):
-        kernel = curio.Kernel()
-        kernel.run(func(*args, **kwargs))
-        kernel.run(shutdown=True)
+        anyio.run(partial(func,*args,**kwargs))
 
     return func_wrapper
 
