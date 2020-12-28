@@ -1,12 +1,11 @@
-'''
+"""
 The disparate session (Session) is for making requests to multiple locations.
-'''
+"""
 
 from abc import ABCMeta, abstractmethod
 from copy import copy
 from functools import partialmethod
-from urllib.parse import urlparse, urlunparse
-import ssl
+from urllib.parse import urlparse, urlunparse, urljoin
 
 from h11 import RemoteProtocolError
 from anyio import connect_tcp, create_semaphore
@@ -17,24 +16,25 @@ from .req_structs import SocketQ
 from .request_object import RequestProcessor
 from .utils import get_netloc_port, timeout_manager
 
-__all__ = ['Session']
+
+__all__ = ["Session"]
 
 
 class BaseSession(metaclass=ABCMeta):
-    '''
+    """
     The base class for asks' sessions.
     Contains methods for creating sockets, figuring out which type of
     socket to create, and all of the HTTP methods ('GET', 'POST', etc.)
-    '''
+    """
 
     def __init__(self, headers=None, ssl_context=None):
-        '''
+        """
         Args:
             headers (dict): Headers to be applied to all requests.
                 headers set by http method call will take precedence and
                 overwrite headers set by the headers arg.
             ssl_context (ssl.SSLContext): SSL context to use for https connections.
-        '''
+        """
         if headers is not None:
             self.headers = headers
         else:
@@ -54,55 +54,60 @@ class BaseSession(metaclass=ABCMeta):
         ...
 
     async def _open_connection_http(self, location):
-        '''
+        """
         Creates a normal async socket, returns it.
         Args:
             location (tuple(str, int)): A tuple of net location (eg
                 '127.0.0.1' or 'example.org') and port (eg 80 or 25000).
-        '''
-        sock = await connect_tcp(location[0], location[1], bind_host=self.source_address)
+        """
+        sock = await connect_tcp(
+            location[0], location[1], local_host=self.source_address
+        )
         sock._active = True
         return sock
 
     async def _open_connection_https(self, location):
-        '''
+        """
         Creates an async SSL socket, returns it.
         Args:
             location (tuple(str, int)): A tuple of net location (eg
                 '127.0.0.1' or 'example.org') and port (eg 80 or 25000).
-        '''
-        sock = await connect_tcp(location[0],
-                                 location[1],
-                                 ssl_context=self.ssl_context,
-                                 bind_host=self.source_address,
-                                 autostart_tls=True,
-                                 tls_standard_compatible=False)
+        """
+        sock = await connect_tcp(
+            location[0],
+            location[1],
+            ssl_context=self.ssl_context,
+            local_host=self.source_address,
+            tls=True,
+            tls_standard_compatible=False,
+        )
         sock._active = True
         return sock
 
     async def _connect(self, host_loc):
-        '''
+        """
         Simple enough stuff to figure out where we should connect, and creates
         the appropriate connection.
-        '''
-        scheme, host, path, parameters, query, fragment = urlparse(
-            host_loc)
+        """
+        parsed_hostloc = urlparse(host_loc)
+        scheme, host, path, parameters, query, fragment = parsed_hostloc
         if parameters or query or fragment:
-            raise ValueError('Supplied info beyond scheme, host.' +
-                             ' Host should be top level only: ', path)
+            raise TypeError(
+                "Supplied info beyond scheme, host."
+                + " Host should be top level only: ",
+                path,
+            )
 
-        host, port = get_netloc_port(scheme, host)
-
-        if scheme == 'http':
-            return await self._open_connection_http(
-                (host, int(port))), port
+        host, port = get_netloc_port(parsed_hostloc)
+        if scheme == "http":
+            return await self._open_connection_http((host, int(port))), port
         else:
-            return await self._open_connection_https(
-                (host, int(port))), port
+            return await self._open_connection_https((host, int(port))), port
 
-    async def request(self, method, url=None, *, path='', retries=1,
-                      connection_timeout=60, **kwargs):
-        '''
+    async def request(
+        self, method, url=None, *, path="", retries=1, connection_timeout=60, **kwargs
+    ):
+        """
         This is the template for all of the `http method` methods for
         the Session.
 
@@ -125,6 +130,8 @@ class BaseSession(metaclass=ABCMeta):
                             the request body.
                         files (dict): A dict of `filename:filepath`s to be sent
                             as multipart.
+                        multipart (dict): Data (files or form data) to be sent as a
+                            multipart form.
                         cookies (dict): A dict of `name:value` cookies to be
                             passed in request.
                         callback (func): A callback function to be called on
@@ -136,19 +143,51 @@ class BaseSession(metaclass=ABCMeta):
                             connection errors.
                         max_redirects (int): The maximum number of redirects
                             allowed.
+                        follow_redirects (bool): Whether to follow redirects
+                            or return raw 3xx responses.
                         persist_cookies (True or None): Passing True
                             instantiates a CookieTracker object to manage the
                             return of cookies to the server under the relevant
                             domains.
                         auth (child of AuthBase): An object for handling auth
                             construction.
+                        stream (bool): Whether or not to return a StreamResponse
+                            vs Response
 
         When you call something like Session.get() or asks.post(), you're
         really calling a partial method that has the 'method' argument
         pre-completed.
-        '''
-        timeout = kwargs.get('timeout', None)
-        req_headers = kwargs.pop('headers', None)
+        """
+
+        ALLOWED_KWARGS = {
+            "data",
+            "params",
+            "headers",
+            "encoding",
+            "json",
+            "files",
+            "multipart",
+            "cookies",
+            "callback",
+            "timeout",
+            "retries",
+            "max_redirects",
+            "follow_redirects",
+            "persist_cookies",
+            "auth",
+            "stream",
+        }
+
+        unknown_kwargs = set(kwargs) - ALLOWED_KWARGS
+        if unknown_kwargs:
+            raise TypeError(
+                "request() got unexpected keyword arguments {!r}".format(
+                    ", ".join(str(x) for x in unknown_kwargs)
+                )
+            ) from None
+
+        timeout = kwargs.get("timeout", None)
+        req_headers = kwargs.pop("headers", None)
 
         if self.headers is not None:
             headers = copy(self.headers)
@@ -158,14 +197,15 @@ class BaseSession(metaclass=ABCMeta):
 
         async with self.sema:
             if url is None:
-                url = self._make_url() + path
+                url = self._make_url(path)
 
             retry = False
 
             sock = None
             try:
                 sock = await timeout_manager(
-                    connection_timeout, self._grab_connection, url)
+                    connection_timeout, self._grab_connection, url
+                )
                 port = sock.port
 
                 req_obj = RequestProcessor(
@@ -193,9 +233,9 @@ class BaseSession(metaclass=ABCMeta):
 
                 if sock is not None:
                     try:
-                        if r.headers['connection'].lower() == 'close':
+                        if r.headers["connection"].lower() == "close":
                             sock._active = False
-                            await sock.close()
+                            await sock.aclose()
                     except KeyError:
                         pass
                     await self.return_to_pool(sock)
@@ -219,29 +259,26 @@ class BaseSession(metaclass=ABCMeta):
             # Session.cleanup should be called to tidy up sockets.
             except BaseException as e:
                 if sock:
-                    await sock.close()
+                    await sock.aclose()
                 raise e
 
         if retry:
-            return (await self.request(method,
-                                       url,
-                                       path=path,
-                                       retries=retries,
-                                       headers=headers,
-                                       **kwargs))
+            return await self.request(
+                method, url, path=path, retries=retries, headers=headers, **kwargs
+            )
 
         return r
 
     # These be the actual http methods!
     # They are partial methods of `request`. See the `request` docstring
     # above for information.
-    get = partialmethod(request, 'GET')
-    head = partialmethod(request, 'HEAD')
-    post = partialmethod(request, 'POST')
-    put = partialmethod(request, 'PUT')
-    delete = partialmethod(request, 'DELETE')
-    options = partialmethod(request, 'OPTIONS')
-    patch = partialmethod(request, 'PATCH')
+    get = partialmethod(request, "GET")
+    head = partialmethod(request, "HEAD")
+    post = partialmethod(request, "POST")
+    put = partialmethod(request, "PUT")
+    delete = partialmethod(request, "DELETE")
+    options = partialmethod(request, "OPTIONS")
+    patch = partialmethod(request, "PATCH")
 
     async def _handle_exception(self, e, sock):
         """
@@ -250,11 +287,11 @@ class BaseSession(metaclass=ABCMeta):
         In all cases we clean up the underlying socket.
         """
         if isinstance(e, (RemoteProtocolError, AssertionError)):
-            await sock.close()
-            raise BadHttpResponse('Invalid HTTP response from server.') from e
+            await sock.aclose()
+            raise BadHttpResponse("Invalid HTTP response from server.") from e
 
         if isinstance(e, Exception):
-            await sock.close()
+            await sock.aclose()
             raise e
 
     @abstractmethod
@@ -280,22 +317,24 @@ class BaseSession(metaclass=ABCMeta):
 
 
 class Session(BaseSession):
-    '''
+    """
     The Session class, for handling piles of requests.
 
     This class inherits from BaseSession, where all of the 'http method'
     methods are defined.
-    '''
+    """
 
-    def __init__(self,
-                 base_location=None,
-                 endpoint=None,
-                 headers=None,
-                 encoding='utf-8',
-                 persist_cookies=None,
-                 ssl_context=None,
-                 connections=1):
-        '''
+    def __init__(
+        self,
+        base_location="",
+        endpoint="",
+        headers=None,
+        encoding="utf-8",
+        persist_cookies=None,
+        ssl_context=None,
+        connections=1,
+    ):
+        """
         Args:
             encoding (str): The encoding asks'll try to use on response bodies.
             persist_cookies (bool): Passing True turns on browserishlike
@@ -304,7 +343,7 @@ class Session(BaseSession):
             connections (int): The max number of concurrent connections to the
                 host asks will allow its self to have. The default number of
                 connections is 1. You may increase this value as you see fit.
-        '''
+        """
         super().__init__(headers, ssl_context)
         self.encoding = encoding
         self.base_location = base_location
@@ -319,6 +358,29 @@ class Session(BaseSession):
 
         self._sema = None
         self._connections = connections
+
+    @property
+    def base_location(self):
+        return self._base_location
+
+    @base_location.setter
+    def base_location(self, value):
+        if not value:
+            self._base_location = value
+        else:
+            self._base_location = self._normalise_last_slashes(value)
+
+    @property
+    def endpoint(self):
+        return self._endpoint
+
+    @endpoint.setter
+    def endpoint(self, value):
+        if not value:
+            self._endpoint = value
+        else:
+            value = self._normalise_head_slashes(value)
+            self._endpoint = self._normalise_last_slashes(value)
 
     @property
     def sema(self):
@@ -346,7 +408,7 @@ class Session(BaseSession):
         return sock
 
     async def _grab_connection(self, url):
-        '''
+        """
         The connection pool handler. Returns a connection
         to the caller. If there are no connections ready, and
         as many connections checked out as there are available total,
@@ -359,9 +421,9 @@ class Session(BaseSession):
             url (str): breaks the url down and uses the top level location
                 info to see if we have any connections to the location already
                 lying around.
-        '''
+        """
         scheme, host, _, _, _, _ = urlparse(url)
-        host_loc = urlunparse((scheme, host, '', '', '', ''))
+        host_loc = urlunparse((scheme, host, "", "", "", ""))
 
         sock = self._checkout_connection(host_loc)
 
@@ -370,11 +432,32 @@ class Session(BaseSession):
 
         return sock
 
-    def _make_url(self):
-        '''
+    def _make_url(self, path):
+        """
         Puts together the hostloc and current endpoint for use in request uri.
-        '''
-        return (self.base_location or '') + (self.endpoint or '')
+        """
+        if not self.base_location:
+            raise ValueError("No base_location set. Cannot construct url.")
+
+        if path:
+            path = self._normalise_last_slashes(path)
+            path = self._normalise_head_slashes(path)
+
+        return "".join((self.base_location, self.endpoint, path))
+
+    @staticmethod
+    def _normalise_last_slashes(url_segment):
+        """
+        Drop any last /'s
+        """
+        return url_segment if not url_segment.endswith("/") else url_segment[:-1]
+
+    @staticmethod
+    def _normalise_head_slashes(url_segment):
+        """
+        Add any missing head /'s
+        """
+        return url_segment if url_segment.startswith("/") else "/" + url_segment
 
     async def __aenter__(self):
         return self

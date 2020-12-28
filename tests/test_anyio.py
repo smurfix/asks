@@ -3,11 +3,14 @@
 import ssl
 from os import path
 from functools import partial
+from pathlib import Path
 
 import pytest
 
 from anyio import create_task_group
 import anyio
+
+from anyio import create_task_group, open_file
 
 from overly import (
     Server,
@@ -31,6 +34,7 @@ from overly import (
 import asks
 from asks.errors import TooManyRedirects, BadStatus, RequestTimeout
 
+pytestmark = pytest.mark.anyio
 
 _TEST_LOC = ("localhost", 25001)
 _SSL_CONTEXT = ssl.create_default_context(cadata=default_ssl_cert)
@@ -41,11 +45,18 @@ def curio_run(func):
     def func_wrapper(*args, **kwargs):
         anyio.run(partial(func,*args,**kwargs))
 
-    return func_wrapper
+@pytest.fixture
+def server(request):
+    srv = Server(_TEST_LOC, **request.param)
+    srv.daemon = True
+    srv.start()
+    srv.ready_to_go.wait()
+    yield srv
+    srv.kill_threads = True
+    srv.join()
 
 
-@Server(_TEST_LOC, steps=[send_200, finish])
-@curio_run
+@pytest.mark.parametrize('server', [dict(steps=[send_200, finish])], indirect=True)
 async def test_http_get(server):
     r = await asks.get(server.http_test_url)
     assert r.status_code == 200
@@ -54,32 +65,42 @@ async def test_http_get(server):
 # GET tests
 
 
-@Server(_TEST_LOC, steps=[send_200, finish], socket_wrapper=ssl_socket_wrapper)
-@curio_run
-async def test_https_get(server):
+@pytest.mark.parametrize('server', [
+    dict(steps=[send_200, finish], socket_wrapper=ssl_socket_wrapper)
+], indirect=True)
+async def test_https_get(server, caplog):
+    import logging
+    caplog.set_level(logging.DEBUG)
     # If we use ssl_context= to trust the CA, then we can successfully do a
     # GET over https.
     r = await asks.get(server.https_test_url, ssl_context=_SSL_CONTEXT)
     assert r.status_code == 200
 
 
-@Server(_TEST_LOC, steps=[send_200, finish], socket_wrapper=ssl_socket_wrapper)
-@curio_run
+@pytest.mark.parametrize('server', [
+    dict(steps=[send_200, finish], socket_wrapper=ssl_socket_wrapper)
+], indirect=True)
 async def test_https_get_checks_cert(server):
+    try:
+        expected_error = ssl.SSLCertVerificationError
+    except AttributeError:
+        # If we're running in Python <3.7, we won't have the specific error
+        # that will be raised, but we can expect it to raise an SSLError
+        # nonetheless
+        expected_error = ssl.SSLError
+
     # The server's certificate isn't signed by any real CA. By default, asks
     # should notice that, and raise an error.
-    with pytest.raises(ssl.SSLCertVerificationError):
+    with pytest.raises(expected_error):
         await asks.get(server.https_test_url)
 
 
-# @curio_run
-# async def test_bad_www_and_schema_get():
+# # async def test_bad_www_and_schema_get():
 #     r = await asks.get('http://reddit.com')
 #     assert r.status_code == 200
 
 
-@Server(_TEST_LOC, steps=[send_400, finish])
-@curio_run
+@pytest.mark.parametrize('server', [dict(steps=[send_400, finish])], indirect=True)
 async def test_http_get_client_error(server):
     r = await asks.get(server.http_test_url)
     with pytest.raises(BadStatus) as excinfo:
@@ -88,8 +109,7 @@ async def test_http_get_client_error(server):
     assert excinfo.value.status_code == 400
 
 
-@Server(_TEST_LOC, steps=[send_500, finish])
-@curio_run
+@pytest.mark.parametrize('server', [dict(steps=[send_500, finish])], indirect=True)
 async def test_http_get_server_error(server):
     r = await asks.get(server.http_test_url)
     with pytest.raises(BadStatus) as excinfo:
@@ -101,18 +121,18 @@ async def test_http_get_server_error(server):
 # Redirect tests
 
 
-@Server(
-    _TEST_LOC,
-    max_requests=4,
-    steps=[
-        [(HttpMethods.GET, "/redirect_1"), send_303, finish],
-        [(HttpMethods.GET, "/"), send_200, finish],
-        [(HttpMethods.GET, "/redirect_1"), send_303, finish],
-        [(HttpMethods.GET, "/"), send_200, finish],
-    ],
-    ordered_steps=True,
-)
-@curio_run
+@pytest.mark.parametrize('server', [
+    dict(
+        max_requests=4,
+        steps=[
+            [(HttpMethods.GET, "/redirect_1"), send_303, finish],
+            [(HttpMethods.GET, "/"), send_200, finish],
+            [(HttpMethods.GET, "/redirect_1"), send_303, finish],
+            [(HttpMethods.GET, "/"), send_200, finish],
+        ],
+        ordered_steps=True,
+    )
+], indirect=True)
 async def test_http_redirect(server):
     r = await asks.get(server.http_test_url + "/redirect_1")
     assert len(r.history) == 1
@@ -123,58 +143,92 @@ async def test_http_redirect(server):
     assert len(r.history) == 1
 
 
-@Server(
-    _TEST_LOC,
-    max_requests=3,
-    steps=[
-        [
-            (HttpMethods.GET, "/redirect_max"),
-            partial(send_303, headers=[("location", "redirect_max1")]),
-            finish,
+@pytest.mark.parametrize('server', [
+    dict(
+        max_requests=3,
+        steps=[
+            [
+                (HttpMethods.GET, "/redirect_max"),
+                partial(send_303, headers=[("location", "redirect_max1")]),
+                finish,
+            ],
+            [
+                (HttpMethods.GET, "/redirect_max1"),
+                partial(send_303, headers=[("location", "redirect_max")]),
+                finish,
+            ],
         ],
-        [
-            (HttpMethods.GET, "/redirect_max1"),
-            partial(send_303, headers=[("location", "redirect_max")]),
-            finish,
-        ],
-    ],
-)
-@curio_run
+    )
+], indirect=True)
 async def test_http_max_redirect_error(server):
     with pytest.raises(TooManyRedirects):
         await asks.get(server.http_test_url + "/redirect_max", max_redirects=1)
 
 
-@Server(
-    _TEST_LOC,
-    max_requests=2,
-    steps=[
-        [
-            (HttpMethods.GET, "/redirect_once"),
-            partial(send_303, headers=[("location", "/")]),
-            finish,
+@pytest.mark.parametrize('server', [
+    dict(
+        max_requests=2,
+        steps=[
+            [
+                (HttpMethods.GET, "/path/redirect"),
+                partial(send_303, headers=[("location", "../foo/bar")]),
+                finish,
+            ],
+            [(HttpMethods.GET, "/foo/bar"), send_200, finish],
         ],
-        [(HttpMethods.GET, "/"), send_200, finish],
-    ],
-)
-@curio_run
+    )
+], indirect=True)
+async def test_redirect_relative_url(server):
+    r = await asks.get(server.http_test_url + "/path/redirect", max_redirects=1)
+    assert len(r.history) == 1
+    assert r.url == "http://{0}:{1}/foo/bar".format(*_TEST_LOC)
+
+
+@pytest.mark.parametrize('server', [
+    dict(
+        max_requests=2,
+        steps=[
+            [
+                (HttpMethods.GET, "/redirect_once"),
+                partial(send_303, headers=[("location", "/")]),
+                finish,
+            ],
+            [(HttpMethods.GET, "/"), send_200, finish],
+        ],
+    )
+], indirect=True)
 async def test_http_under_max_redirect(server):
     r = await asks.get(server.http_test_url + "/redirect_once", max_redirects=2)
     assert r.status_code == 200
 
 
+@pytest.mark.parametrize('server', [
+    dict(
+        max_requests=1,
+        steps=[
+            [
+                (HttpMethods.GET, "/redirect_once"),
+                partial(send_303, headers=[("location", "/")]),
+                finish,
+            ],
+        ],
+    )
+], indirect=True)
+async def test_dont_follow_redirects(server):
+    r = await asks.get(server.http_test_url + "/redirect_once", follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"] == "/"
+
 # Timeout tests
 
 
-@Server(_TEST_LOC, steps=[delay(2), send_200, finish])
-@curio_run
+@pytest.mark.parametrize('server', [dict(steps=[delay(2), send_200, finish])], indirect=True)
 async def test_http_timeout_error(server):
     with pytest.raises(RequestTimeout):
         await asks.get(server.http_test_url, timeout=1)
 
 
-@Server(_TEST_LOC, steps=[send_200, finish])
-@curio_run
+@pytest.mark.parametrize('server', [dict(steps=[send_200, finish])], indirect=True)
 async def test_http_timeout(server):
     r = await asks.get(server.http_test_url, timeout=10)
     assert r.status_code == 200
@@ -183,8 +237,7 @@ async def test_http_timeout(server):
 # Param set test
 
 
-@Server(_TEST_LOC, steps=[send_request_as_json, finish])
-@curio_run
+@pytest.mark.parametrize('server', [dict(steps=[send_request_as_json, finish])], indirect=True)
 async def test_param_dict_set(server):
     r = await asks.get(server.http_test_url, params={"cheese": "the best"})
     j = r.json()
@@ -194,8 +247,7 @@ async def test_param_dict_set(server):
 # Data set test
 
 
-@Server(_TEST_LOC, steps=[send_request_as_json, finish])
-@curio_run
+@pytest.mark.parametrize('server', [dict(steps=[send_request_as_json, finish])], indirect=True)
 async def test_data_dict_set(server):
     r = await asks.post(server.http_test_url, data={"cheese": "please bby"})
     j = r.json()
@@ -205,8 +257,9 @@ async def test_data_dict_set(server):
 # Cookie send test
 
 
-@Server(_TEST_LOC, steps=[accept_cookies_and_respond, finish])
-@curio_run
+@pytest.mark.parametrize('server', [
+    dict(steps=[accept_cookies_and_respond, finish])
+], indirect=True)
 async def test_cookie_dict_send(server):
 
     cookies = {"Test-Cookie": "Test Cookie Value", "koooookie": "pie"}
@@ -224,8 +277,7 @@ async def test_cookie_dict_send(server):
 # Custom headers test
 
 
-@Server(_TEST_LOC, steps=[send_request_as_json, finish])
-@curio_run
+@pytest.mark.parametrize('server', [dict(steps=[send_request_as_json, finish])], indirect=True)
 async def test_header_set(server):
     r = await asks.get(
         server.http_test_url, headers={"Asks-Header": "Test Header Value"}
@@ -244,8 +296,7 @@ TEST_FILE1 = path.join(TEST_DIR, "test_file1.txt")
 TEST_FILE2 = path.join(TEST_DIR, "test_file2")
 
 
-@Server(_TEST_LOC, steps=[send_request_as_json, finish])
-@curio_run
+@pytest.mark.parametrize('server', [dict(steps=[send_request_as_json, finish])], indirect=True)
 async def test_file_send_single(server):
     r = await asks.post(server.http_test_url, files={"file_1": TEST_FILE1})
     j = r.json()
@@ -258,8 +309,7 @@ async def test_file_send_single(server):
     assert file_data["file"] == "Compooper"
 
 
-@Server(_TEST_LOC, steps=[send_request_as_json, finish])
-@curio_run
+@pytest.mark.parametrize('server', [dict(steps=[send_request_as_json, finish])], indirect=True)
 async def test_file_send_double(server):
     r = await asks.post(
         server.http_test_url, files={"file_1": TEST_FILE1, "file_2": TEST_FILE2}
@@ -279,8 +329,7 @@ async def test_file_send_double(server):
     assert file_data_2["file"] == "My slug <3"
 
 
-@Server(_TEST_LOC, steps=[send_request_as_json, finish])
-@curio_run
+@pytest.mark.parametrize('server', [dict(steps=[send_request_as_json, finish])], indirect=True)
 async def test_file_send_file_and_form_data(server):
     r = await asks.post(
         server.http_test_url,
@@ -302,11 +351,122 @@ async def test_file_send_file_and_form_data(server):
     assert form_data_1["form_data"] == "watwatwatwat=yesyesyes"
 
 
+# File send test new multipart API
+
+
+TEST_DIR = path.dirname(path.abspath(__file__))
+TEST_FILE1 = path.join(TEST_DIR, "test_file1.txt")
+TEST_FILE2 = path.join(TEST_DIR, "test_file2")
+
+
+@pytest.mark.parametrize('server', [dict(steps=[send_request_as_json, finish])], indirect=True)
+async def test_multipart_send_single(server):
+    r = await asks.post(server.http_test_url, multipart={"file_1": Path(TEST_FILE1)})
+    j = r.json()
+
+    assert any(file_data["name"] == "file_1" for file_data in j["files"])
+
+    file_data = next(
+        file_data for file_data in j["files"] if file_data["name"] == "file_1"
+    )
+    assert file_data["file"] == "Compooper"
+
+
+@pytest.mark.parametrize('server', [dict(steps=[send_request_as_json, finish])], indirect=True)
+async def test_multipart_send_single_already_open(server):
+    with open(TEST_FILE1, "rb") as f:
+        r = await asks.post(server.http_test_url, multipart={"file_1": f})
+    j = r.json()
+
+    assert any(file_data["name"] == "file_1" for file_data in j["files"])
+
+    file_data = next(
+        file_data for file_data in j["files"] if file_data["name"] == "file_1"
+    )
+    assert file_data["file"] == "Compooper"
+
+
+@pytest.mark.parametrize('server', [dict(steps=[send_request_as_json, finish])], indirect=True)
+async def test_multipart_send_single_already_open_async(server):
+    async with await open_file(TEST_FILE1, "rb") as f:
+        r = await asks.post(server.http_test_url, multipart={"file_1": f})
+    j = r.json()
+
+    assert any(file_data["name"] == "file_1" for file_data in j["files"])
+
+    file_data = next(
+        file_data for file_data in j["files"] if file_data["name"] == "file_1"
+    )
+    assert file_data["file"] == "Compooper"
+
+
+@pytest.mark.parametrize('server', [dict(steps=[send_request_as_json, finish])], indirect=True)
+async def test_multipart_send_raw_bytes(server):
+    r = await asks.post(
+        server.http_test_url,
+        multipart={
+            "file_1": asks.multipart.MultipartData(
+                b"Compooper", basename="in_memory.txt",
+            )
+        },
+    )
+    j = r.json()
+
+    assert any(file_data["name"] == "file_1" for file_data in j["files"])
+
+    file_data = next(
+        file_data for file_data in j["files"] if file_data["name"] == "file_1"
+    )
+    assert file_data["file"] == "Compooper"
+
+
+@pytest.mark.parametrize('server', [dict(steps=[send_request_as_json, finish])], indirect=True)
+async def test_multipart_send_double(server):
+    r = await asks.post(
+        server.http_test_url,
+        multipart={"file_1": Path(TEST_FILE1), "file_2": Path(TEST_FILE2)},
+    )
+    j = r.json()
+
+    assert any(file_data["name"] == "file_1" for file_data in j["files"])
+    assert any(file_data["name"] == "file_2" for file_data in j["files"])
+
+    file_data_1 = next(
+        file_data for file_data in j["files"] if file_data["name"] == "file_1"
+    )
+    file_data_2 = next(
+        file_data for file_data in j["files"] if file_data["name"] == "file_2"
+    )
+    assert file_data_1["file"] == "Compooper"
+    assert file_data_2["file"] == "My slug <3"
+
+
+@pytest.mark.parametrize('server', [dict(steps=[send_request_as_json, finish])], indirect=True)
+async def test_multipart_send_file_and_form_data(server):
+    r = await asks.post(
+        server.http_test_url,
+        multipart={"file_1": Path(TEST_FILE1), "data_1": "watwatwatwat=yesyesyes"},
+    )
+    j = r.json()
+
+    assert any(file_data["name"] == "file_1" for file_data in j["files"])
+    assert any(form_data["name"] == "data_1" for form_data in j["forms"])
+
+    file_data_1 = next(
+        file_data for file_data in j["files"] if file_data["name"] == "file_1"
+    )
+    assert file_data_1["file"] == "Compooper"
+
+    form_data_1 = next(
+        form_data for form_data in j["forms"] if form_data["name"] == "data_1"
+    )
+    assert form_data_1["form_data"] == "watwatwatwat=yesyesyes"
+
+
 # JSON send test
 
 
-@Server(_TEST_LOC, steps=[send_request_as_json, finish])
-@curio_run
+@pytest.mark.parametrize('server', [dict(steps=[send_request_as_json, finish])], indirect=True)
 async def test_json_send(server):
     r = await asks.post(
         server.http_test_url, json={"key_1": True, "key_2": "cheesestring"}
@@ -322,15 +482,17 @@ async def test_json_send(server):
 # Test decompression
 
 
-@Server(_TEST_LOC, steps=[partial(send_gzip, data="wolowolowolo"), finish])
-@curio_run
+@pytest.mark.parametrize('server', [
+    dict(steps=[partial(send_gzip, data="wolowolowolo"), finish])
+], indirect=True)
 async def test_gzip(server):
     r = await asks.get(server.http_test_url)
     assert r.text == "wolowolowolo"
 
 
-@Server(_TEST_LOC, steps=[partial(send_deflate, data="wolowolowolo"), finish])
-@curio_run
+@pytest.mark.parametrize('server', [
+    dict(steps=[partial(send_deflate, data="wolowolowolo"), finish])
+], indirect=True)
 async def test_deflate(server):
     r = await asks.get(server.http_test_url)
     assert r.text == "wolowolowolo"
@@ -339,15 +501,17 @@ async def test_deflate(server):
 # Test chunks and streaming
 
 
-@Server(_TEST_LOC, steps=[partial(send_chunked, data=["ham "] * 10), finish])
-@curio_run
+@pytest.mark.parametrize('server', [
+    dict(steps=[partial(send_chunked, data=["ham "] * 10), finish])
+], indirect=True)
 async def test_chunked(server):
     r = await asks.get(server.http_test_url)
     assert r.text == "ham ham ham ham ham ham ham ham ham ham "
 
 
-@Server(_TEST_LOC, steps=[partial(send_chunked, data=["ham "] * 10), finish])
-@curio_run
+@pytest.mark.parametrize('server', [
+    dict(steps=[partial(send_chunked, data=["ham "] * 10), finish])
+], indirect=True)
 async def test_stream(server):
     data = b""
     r = await asks.get(server.http_test_url, stream=True)
@@ -359,8 +523,9 @@ async def test_stream(server):
 # Test callback
 
 
-@Server(_TEST_LOC, steps=[partial(send_chunked, data=["ham "] * 10), finish])
-@curio_run
+@pytest.mark.parametrize('server', [
+    dict(steps=[partial(send_chunked, data=["ham "] * 10), finish])
+], indirect=True)
 async def test_callback(server):
     async def callback_example(chunk):
         nonlocal callback_data
@@ -374,11 +539,11 @@ async def test_callback(server):
 # Test connection close without content-length and transfer-encoding
 
 
-@Server(
-    _TEST_LOC,
-    steps=[partial(send_200_blank_headers, headers=[("connection", "close")]), finish],
-)
-@curio_run
+@pytest.mark.parametrize('server', [
+    dict(
+        steps=[partial(send_200_blank_headers, headers=[("connection", "close")]), finish],
+    )
+], indirect=True)
 async def test_connection_close_no_content_len(server):
     r = await asks.get(server.http_test_url)
     assert r.text == "200"
@@ -390,12 +555,12 @@ async def test_connection_close_no_content_len(server):
 # Test Session with two pooled connections on ten get requests.
 
 
-@Server(
-    _TEST_LOC,
-    steps=[partial(send_200_blank_headers, headers=[("connection", "close")]), finish],
-    max_requests=10,
-)
-@curio_run
+@pytest.mark.parametrize('server', [
+    dict(
+        steps=[partial(send_200_blank_headers, headers=[("connection", "close")]), finish],
+        max_requests=10,
+    )
+], indirect=True)
 async def test_session_smallpool(server):
     async def worker(s):
         r = await s.get(path="/get")
@@ -411,8 +576,9 @@ async def test_session_smallpool(server):
 
 
 # TODO check the "" quoting of cookies here (probably in overly)
-@Server(_TEST_LOC, steps=[accept_cookies_and_respond, finish])
-@curio_run
+@pytest.mark.parametrize('server', [
+    dict(steps=[accept_cookies_and_respond, finish])
+], indirect=True)
 async def test_session_stateful(server):
     s = asks.Session(server.http_test_url, persist_cookies=True)
     await s.get(cookies={"Test-Cookie": "Test Cookie Value"})
@@ -431,3 +597,10 @@ def test_instantiate_session_outside_of_event_loop():
         asks.Session()
     except RuntimeError:
         pytest.fail("Could not instantiate Session outside of event loop")
+
+
+async def test_session_unknown_kwargs():
+    with pytest.raises(TypeError, match=r"request\(\) got .*"):
+        session = asks.Session("https://httpbin.org/get")
+        await session.request("GET", ko=7, foo=0, bar=3, shite=3)
+        pytest.fail("Passing unknown kwargs does not raise TypeError")
