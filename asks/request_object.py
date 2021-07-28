@@ -656,7 +656,7 @@ class RequestProcessor:
                 try:
                     data = await self.sock.receive()
                 except EndOfStream:
-                    data = ""  # the old way to say EOF
+                    data = b""
                 h11_connection.receive_data(data)
                 continue
             return event
