@@ -32,7 +32,7 @@ The ``Session``'s ``connections`` argument dictates the maximum number of concur
 **The default number of connections in the pool for a Session is a measly ONE.** If I arbitrarily picked a number greater than one it would be too high for 49% of people and too low for the other 49%. ::
 
     import asks
-    import curio
+    import anyio
 
     a_list_of_many_urls = ['wow', 'so', 'many', 'urls']
 
@@ -42,10 +42,11 @@ The ``Session``'s ``connections`` argument dictates the maximum number of concur
 
     async def main(url_list):
         s = asks.Session(connections=20)
-        for url in url_list:
-            await curio.spawn(worker(s, url))
+        async with anyio.create_task_group() as tg:
+            for url in url_list:
+                tg.start_soon(worker(s, url))
 
-    curio.run(main(a_list_of_many_urls))
+    anyio.run(main, a_list_of_many_urls)
 
 
 Session Headers
@@ -92,7 +93,7 @@ The result will be a bunch of calls that look like
 Please don't actually do this or the http://jsontest.com website will be very unhappy. ::
 
     import asks
-    import curio
+    import anyio
 
     async def worker(s, num):
         r = await s.get(path='/' + str(num))
@@ -102,9 +103,10 @@ Please don't actually do this or the http://jsontest.com website will be very un
         s = asks.Session(connections=50)
         s.base_location = 'http://echo.jsontest.com'
         s.endpoint = '/asks/test'
-        for i in range(1, 1001):
-            await curio.spawn(worker(s, i))
+        async with anyio.create_task_group() as tg:
+            for i in range(1, 1001):
+                anyio.start_soon(worker, s, i)
 
-    curio.run(main())
+    anyio.run(main)
 
 You may override the ``base_location`` and ``endpoint`` by passing a URL normally.

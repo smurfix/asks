@@ -85,7 +85,7 @@ Sending JSON
 ____________
 
 Pass Python ``dict`` objects to the ``json`` argument to send them as JSON in your request.
-Note that if your workflow here involves opening a JSON file, you should use ``curio``'s ``aopen()`` or ``trio``'s ``open_file()`` to avoid stalling the program on disk reads. ::
+Note that if your workflow here involves opening a JSON file, you should use ``anyio``'s ``open_file()`` to avoid stalling the program on disk reads. ::
 
     dict_to_send = {'Data_1': 'Important thing',
                     'Data_2': 'Really important thing'}
@@ -260,31 +260,31 @@ _______________________
 You can stream the body of a response by setting ``stream=True`` , and iterating the response object's ``.body`` . An example of downloading a file: ::
 
     import asks
-    import curio
+    import anyio
 
     async def main():
         r = await asks.get('http://httpbin.org/image/png', stream=True)
-        async with curio.aopen('our_image.png', 'ab') as out_file:
+        async with await anyio.open_file('our_image.png', 'ab') as out_file:
             async for bytechunk in r.body:
-                out_file.write(bytechunk)
+                await out_file.write(bytechunk)
 
-    curio.run(main())
+    anyio.run(main)
 
 
 It is important to note that if you do not iterate the ``.body`` to completion, bad things may happen as the connection sits there and isn't returned to the connection pool.
 You can get around this by context-managering the ``.body`` if there is a chance you might not iterate fully. ::
 
     import asks
-    import curio
+    import anyio
 
     async def main():
         r = await asks.get('http://httpbin.com/image/png', stream=True)
-        async with curio.aopen('our_image.png', 'wb') as out_file:
-            async with r.body: # Bam! Safe!
-                async for bytechunk in r.body:
+        async with await anyio.open_file('our_image.png', 'wb') as out_file:
+            async with r.body as chunks: # Bam! Safe!
+                async for bytechunk in chunks:
                     await out_file.write(bytechunk)
 
-    curio.run(main())
+    anyio.run(main())
 
 This way, once you leave the ``async with`` block, ``asks`` will automatically ensure the underlying socket is handled properly. You may also call ``.body.close()`` to manually close the stream.
 

@@ -7,7 +7,7 @@ jobs:
 
 
 install:
-   - pip install 'anyio[curio,trio] ~= 2.0'
+   - pip install 'anyio ~= 4.0'
    - pip install overly
    - pip install "pytest >= 3.7.2"
    - pip install -e .
