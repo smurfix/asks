@@ -5,8 +5,8 @@ Sanely making many requests (with semaphores)
 _____________________________________________
 
 A (bounded) semaphore is like a sofa (sofaphore?). It can only fit so many tasks at once.
-If we have a semaphore who's maximum size is ``5`` then only ``5`` tasks can sit on it.
-If one task finishes, another task can sit down.
+If we have a semaphore whose maximum size is ``5`` then only ``5`` tasks can sit on it.
+When one task finishes, another task can sit down.
 This is an extremely simple and effective way to manage the resources used by ``asks`` when making large amounts of requests.
 
 If we wanted to request two thousand urls, we wouldn't want to spawn two thousand tasks and have them all fight for CPU time. ::
