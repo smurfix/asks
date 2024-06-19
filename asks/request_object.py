@@ -28,7 +28,7 @@ from .errors import TooManyRedirects
 from .multipart import build_multipart_body
 
 
-_BOUNDARY = "8banana133744910kmmr13a56!102!" + str(randint(1e3, 9e3))
+_BOUNDARY = "8banana133744910kmmr13a56!102!" + str(randint(10 ** 3, 10 ** 9))
 _WWX_MATCH = re.compile(r"\Aww.\.")
 
 
@@ -174,7 +174,7 @@ class RequestProcessor:
                 ("Accept-Encoding", "gzip, deflate"),
                 ("Accept", "*/*"),
                 ("Content-Length", "0"),
-                ("User-Agent", "python-asks/2.4.12"),
+                ("User-Agent", "python-asks/3.0.0"),
             ]
         )
 
@@ -365,7 +365,7 @@ class RequestProcessor:
             location = urljoin(self.uri, location.strip())
             if self.auth is not None:
                 if not self.auth_off_domain:
-                    allow_redirect = self._location_auth_protect(location)
+                    allow_redirect = await self._location_auth_protect(location)
             self.uri = location
             l_scheme, l_netloc, *_ = urlparse(location)
             if l_scheme != self.scheme or l_netloc != self.host:

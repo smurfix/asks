@@ -12,7 +12,7 @@ setup(
     description='asks - async http',
     long_description='asks is an async http lib for anyio, trio and asyncio',
     license='MIT',
-    version='2.5.0',
+    version='3.0.0',
     author='Mark Jameson - aka theelous3',
     url='https://github.com/theelous3/asks',
     packages=['asks'],
