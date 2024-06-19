@@ -20,13 +20,11 @@ _____________
 
 ``asks`` is an async HTTP lib that can best be described as an effort to bring the same level of usable abstraction that ``requests`` offers synchronous Python, to asynchronous Python programming. Ideal for API interactions, webscraping etc.
 
-``asks`` is compatible with ``curio`` and ``trio``.
+``asks`` is compatible with ``asyncio`` and ``trio``.
 
-It is important to note that the code examples in this documentation are to showcase ``asks``, and not ``curio`` or ``trio``.
+It is important to note that the code examples in this documentation are to showcase ``asks``, and not ``asyncio`` or ``trio``.
 In real code, it would be beneficial to use things like taskgroups/nurserys and other neat tools to manage your requests.
-Here's a link to ``curio`` and ``trio``'s docs for reference:
-
-http://curio.rtfd.io/
+Here's a link to ``trio``'s docs for reference:
 
 http://trio.rtfd.io
 
@@ -42,21 +40,21 @@ The easiest way to install ``asks`` is to pip it::
 
 Internally ``asks`` uses the excellent `h11 <https://github.com/njsmith/h11>`_. It will be installed automatically.
 
-``asks`` was built for use with `curio <https://github.com/dabeaz/curio>`_ and `trio <https://github.com/python-trio/trio>`_
+``asks`` was built for use with `anyio <https://github.com/agronholm/anyio>`_ and `trio <https://github.com/python-trio/trio>`_
 
 Importing ``asks``
 __________________
 
-The following code will run the ``example`` coroutine once with ``curio`` and once with ``trio``: ::
+The following code will run the ``example`` coroutine once with ``anyio`` and once with ``trio``: ::
 
     import asks
-    import curio
+    import anyio
     import trio
 
     async def example():
         r = await asks.get('https://example.org')
 
-    curio.run(example)
+    anyio.run(example)
 
     trio.run(example)
 
@@ -64,9 +62,10 @@ The following code will run the ``example`` coroutine once with ``curio`` and on
 A quick note on the examples in these docs
 __________________________________________
 
-``asks`` began by only supporting ``curio``, and the code examples use ``curio`` throughout.
-At any point in the examples you could switch say, ``async with curio.TaskGroup`` to ``async with trio.open_nursery``, and everything would be the same bar ``curio``/``trio``'s API differences.
-Internally, ``asks`` has no bias for either library. Both are beautiful creatures.
+``asks`` began by only supporting ``curio``. It has since been ported to use ``anyio``, thus it works with ``asyncio`` as well as ``trio`` backends. The code examples use ``anyio`` throughout.
+``curio`` support was dropped from ``anyio`` because supporting it required too many API incompatibilities with ``asyncio`` and ``trio``.
+At any point in the examples you could switch say, ``async with anyio.TaskGroup`` to ``async with trio.open_nursery`` or ``async with asyncio.TaskGroup``, and everything would be the same bar ``anyio``/``asyncio``/``trio``'s API differences.
+Internally, ``asks`` has no bias for either library.
 
 A little example:
 _________________
@@ -75,13 +74,13 @@ Here's how to grab a single request and print its content::
 
     # single_get.py
     import asks
-    import curio
+    import anyio
 
     async def grabber(url):
         r = await asks.get(url)
         print(r.content)
 
-    curio.run(grabber('https://example.com'))
+    anyio.run(grabber, 'https://example.com')
 
     # Results in:
     # b'<!doctype html>\n<html>\n<head>\n    <title>Example Domain</title>\n\n
@@ -102,7 +101,7 @@ We'll use the ``Session`` class here to take advantage of connection pooling.::
     # Using the homogeneous-session.
 
     import asks
-    import curio
+    import anyio
 
     path_list = ['a', 'list', 'of', '1000', 'paths']
 
@@ -116,10 +115,11 @@ We'll use the ``Session`` class here to take advantage of connection pooling.::
         retrieved_responses.append(r)
 
     async def main(path_list):
-        for path in path_list:
-            curio.spawn(grabber(path))
+        async with anyio.create_task_group() as tg:
+            for path in path_list:
+                tg.start_soon(grabber, path)
 
-    curio.run(main(path_list))
+    anyio.run(main, path_list))
 
 Now we're talkin'.
 
@@ -129,7 +129,7 @@ A thousand ``requests`` running async at the drop of a hat, using clean burning 
 Why asks?
 _________
 
-If you like async, but don't like the spaghetti-docs future-laden many-looped ``asyncio`` lib, you'll probably love ``curio`` and ``trio``. If you wish you could marry them with requests, you'll probably love ``asks``.
+If you like async, but don't like the spaghetti-docs future-laden many-looped ``asyncio`` lib, you'll probably love ``anyio`` and ``trio``. If you wish you could marry them with requests, you'll probably love ``asks``.
 
 Nice libs like ``aiohttp`` suffer the side effect of ugliness due to being specifically for ``asyncio``.
 Inspired by ``requests`` and the fancy new-age async libs, I wanted to take that lovely ultra abstraction and apply it to an async HTTP lib to alleviate some of the pain in dealing with async HTTP.
